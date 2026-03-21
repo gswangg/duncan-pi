@@ -508,6 +508,106 @@ export function getAncestorChain(sessionFile: string, sessionDir: string): strin
   return chain;
 }
 
+// ============================================================================
+// Target resolution + pagination — pure, testable
+// ============================================================================
+
+const LIMITED_MODES = new Set(["ancestors", "descendants", "project", "global"]);
+const DEFAULT_LIMIT = 50;
+
+export interface ResolveParams {
+  sessions: string;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ResolveResult {
+  targets: DuncanTarget[];
+  totalWindows: number;
+  hasMore: boolean;
+  offset: number;
+  limit: number;
+  error?: string;
+}
+
+/**
+ * Resolve session mode + pagination into a page of DuncanTargets.
+ * Pure function — no ctx, no model, no API calls.
+ */
+export function resolveTargets(
+  params: ResolveParams,
+  sessionFile: string,
+  sessionDir: string,
+): ResolveResult {
+  const limit = params.limit ?? (LIMITED_MODES.has(params.sessions) ? DEFAULT_LIMIT : Infinity);
+  const offset = params.offset ?? 0;
+
+  let sessionFiles: string[] = [];
+  let error: string | undefined;
+
+  if (params.sessions === "parent") {
+    const chain = getAncestorChain(sessionFile, sessionDir);
+    if (chain.length < 2) error = "No parent session found.";
+    else sessionFiles = [chain[1]];
+  } else if (params.sessions === "ancestors") {
+    sessionFiles = getAncestorChain(sessionFile, sessionDir);
+    if (sessionFiles.length === 0) error = "No ancestor sessions found.";
+  } else if (params.sessions === "descendants") {
+    sessionFiles = getDescendantChain(sessionFile, sessionDir);
+    if (sessionFiles.length === 0) error = "No descendant sessions found.";
+  } else if (params.sessions === "project") {
+    sessionFiles = getProjectSessions(sessionDir);
+    if (sessionFiles.length === 0) error = "No sessions found in this project directory.";
+  } else if (params.sessions === "global") {
+    sessionFiles = getGlobalSessions(sessionDir);
+    if (sessionFiles.length === 0) error = "No sessions found.";
+  } else {
+    const target = path.resolve(sessionDir, params.sessions);
+    if (!existsSync(target)) error = `Session not found: ${params.sessions}`;
+    else sessionFiles = [target];
+  }
+
+  if (error) {
+    return { targets: [], totalWindows: 0, hasMore: false, offset, limit, error };
+  }
+
+  // Deduplicate
+  sessionFiles = [...new Set(sessionFiles)];
+
+  // Expand to windows
+  const allTargets: DuncanTarget[] = [];
+  for (const file of sessionFiles) {
+    try {
+      const windows = getDuncanTargets(file);
+      if (file === sessionFile) {
+        windows.pop(); // drop active context window
+      }
+      allTargets.push(...windows);
+    } catch {
+      // skip unparseable files
+    }
+  }
+
+  if (allTargets.length === 0) {
+    return { targets: [], totalWindows: 0, hasMore: false, offset, limit, error: "No queryable context found in target sessions." };
+  }
+
+  const totalWindows = allTargets.length;
+  const page = allTargets.slice(offset, offset + limit);
+
+  if (page.length === 0) {
+    return { targets: [], totalWindows, hasMore: false, offset, limit, error: `No windows in range (offset ${offset}, total ${totalWindows}).` };
+  }
+
+  return {
+    targets: page,
+    totalWindows,
+    hasMore: offset + limit < totalWindows,
+    offset,
+    limit,
+  };
+}
+
 /**
  * Resolve model and API key from extension context.
  */
@@ -572,82 +672,15 @@ export default function (pi: ExtensionAPI) {
       }
 
       const sessionDir = path.dirname(sessionFile);
-      let targets: string[] = [];
-      const LIMITED_MODES = new Set(["ancestors", "descendants", "project", "global"]);
-      const DEFAULT_LIMIT = 50;
-      const limit = params.limit ?? (LIMITED_MODES.has(params.sessions) ? DEFAULT_LIMIT : Infinity);
-      const offset = params.offset ?? 0;
+      const resolved = resolveTargets(params, sessionFile, sessionDir);
 
-      if (params.sessions === "parent") {
-        const chain = getAncestorChain(sessionFile, sessionDir);
-        // chain[0] is self — parent is chain[1]
-        if (chain.length < 2) {
-          return { content: [{ type: "text", text: "No parent session found." }], isError: true };
-        }
-        targets = [chain[1]];
-      } else if (params.sessions === "ancestors") {
-        targets = getAncestorChain(sessionFile, sessionDir);
-        if (targets.length === 0) {
-          return { content: [{ type: "text", text: "No ancestor sessions found." }], isError: true };
-        }
-      } else if (params.sessions === "descendants") {
-        targets = getDescendantChain(sessionFile, sessionDir);
-        if (targets.length === 0) {
-          return { content: [{ type: "text", text: "No descendant sessions found." }], isError: true };
-        }
-      } else if (params.sessions === "project") {
-        targets = getProjectSessions(sessionDir);
-        if (targets.length === 0) {
-          return { content: [{ type: "text", text: "No sessions found in this project directory." }], isError: true };
-        }
-      } else if (params.sessions === "global") {
-        targets = getGlobalSessions(sessionDir);
-        if (targets.length === 0) {
-          return { content: [{ type: "text", text: "No sessions found." }], isError: true };
-        }
-      } else {
-        // Treat as filename — resolve relative to session dir
-        const target = path.resolve(sessionDir, params.sessions);
-        if (!existsSync(target)) {
-          return { content: [{ type: "text", text: `Session not found: ${params.sessions}` }], isError: true };
-        }
-        targets = [target];
+      if (resolved.error) {
+        return { content: [{ type: "text", text: resolved.error }], isError: true };
       }
 
-      // Deduplicate session files (ancestor + project could overlap)
-      targets = [...new Set(targets)];
-
-      // Expand session files into duncan targets (one per compaction window)
-      const allTargets: DuncanTarget[] = [];
-      for (const target of targets) {
-        try {
-          const windows = getDuncanTargets(target);
-          if (target === sessionFile) {
-            // Current session: drop the last window (that's our active context),
-            // but keep earlier windows — those are behind compaction barriers
-            windows.pop();
-          }
-          allTargets.push(...windows);
-        } catch (err: any) {
-          // If a file can't be parsed, skip it
-        }
-      }
-
-      if (allTargets.length === 0) {
-        return { content: [{ type: "text", text: "No queryable context found in target sessions." }], isError: true };
-      }
-
-      // Apply offset and limit
-      const totalWindows = allTargets.length;
-      const duncanTargets = allTargets.slice(offset, offset + limit);
-
-      if (duncanTargets.length === 0) {
-        return { content: [{ type: "text", text: `No windows in range (offset ${offset}, total ${totalWindows}).` }], isError: true };
-      }
-
+      const { targets: duncanTargets, totalWindows, hasMore, offset } = resolved;
       const sessionCount = new Set(duncanTargets.map(t => t.sessionFile)).size;
       const windowCount = duncanTargets.length;
-      const hasMore = offset + limit < totalWindows;
 
       const update = (text: string) => onUpdate?.({ content: [{ type: "text", text }] });
       const rangeLabel = hasMore || offset > 0 ? ` (${offset}–${offset + windowCount} of ${totalWindows})` : "";
