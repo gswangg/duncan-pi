@@ -71,9 +71,18 @@ The `sessions` parameter controls which sessions are searched:
 | `parent` | Immediate parent only |
 | `descendants` | Children, breadth-first |
 | `project` | All sessions in the same working directory, newest first |
+| `global` | All sessions across all working directories, newest first |
 | `<filename>` | A specific session file |
 
 Each session/window is queried independently. Duncan uses structured output (tool call) to get a `hasContext` boolean from each query — only answers that actually found relevant context are returned.
+
+### Pagination
+
+Multi-session modes (`ancestors`, `descendants`, `project`, `global`) default to 50 windows per query. If there are more, the response includes pagination info. The LLM (or you via the skill) can request the next batch:
+
+```
+/skill:duncan same question, but search the next batch (offset 50)
+```
 
 ## Development
 

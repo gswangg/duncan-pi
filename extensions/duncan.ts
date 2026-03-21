@@ -434,8 +434,7 @@ function getSessionPreview(sessionFile: string): string {
 }
 
 /**
- * Get all session files in a directory, ordered by recency (newest first),
- * excluding the specified session file.
+ * Get all session files in a directory, ordered by recency (newest first).
  */
 function getProjectSessions(sessionDir: string): string[] {
   try {
@@ -443,6 +442,30 @@ function getProjectSessions(sessionDir: string): string[] {
       .filter(f => f.endsWith(".jsonl"))
       .sort((a, b) => b.localeCompare(a)) // newest first (timestamp prefix)
       .map(f => path.join(sessionDir, f));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Get all session files across all project directories, ordered by recency (newest first).
+ */
+function getGlobalSessions(sessionDir: string): string[] {
+  const sessionsRoot = path.dirname(sessionDir); // ~/.pi/agent/sessions/
+  try {
+    const dirs = readdirSync(sessionsRoot, { withFileTypes: true })
+      .filter(d => d.isDirectory())
+      .map(d => path.join(sessionsRoot, d.name));
+    const allFiles: string[] = [];
+    for (const dir of dirs) {
+      try {
+        const files = readdirSync(dir)
+          .filter(f => f.endsWith(".jsonl"))
+          .map(f => path.join(dir, f));
+        allFiles.push(...files);
+      } catch { /* skip unreadable dirs */ }
+    }
+    return allFiles.sort((a, b) => path.basename(b).localeCompare(path.basename(a)));
   } catch {
     return [];
   }
@@ -528,15 +551,19 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "duncan — query dormant sessions from previous handoffs for information not in current context",
     promptGuidelines: [
       "Use duncan when the current context references a previous session or when the user asks about work done in earlier sessions.",
-      "The 'sessions' parameter accepts 'parent' (immediate parent only), 'ancestors' (walk up lineage, parent first), 'descendants' (walk down to children, BFS), 'project' (all sessions from same working directory, newest first), or a specific session filename.",
+      "The 'sessions' parameter accepts 'parent' (immediate parent only), 'ancestors' (walk up lineage, parent first), 'descendants' (walk down to children, BFS), 'project' (all sessions from same working directory, newest first), 'global' (all sessions across all projects, newest first), or a specific session filename.",
       "For 'ancestors' mode, sessions are queried parent-first — the answer comes from the first session that has relevant information.",
       "For 'descendants' mode, child sessions are queried breadth-first. Use when you spawned work via /dfork and need to know what happened in those sessions.",
       "For 'project' mode, all sessions started from the same working directory are queried (newest first). Use when the information might be in a non-ancestor session from the same project.",
+      "For 'global' mode, all sessions across all working directories are queried (newest first). Use as a last resort when the information might be in an unrelated project.",
       "Keep questions specific and self-contained — the dormant session has no knowledge of the current conversation.",
+      "Results include pagination info when not all windows were queried. Call again with a higher offset to continue searching.",
     ],
     parameters: Type.Object({
       question: Type.String({ description: "The question to ask the dormant session. Should be specific and self-contained." }),
-      sessions: Type.String({ description: "Which sessions to query: 'parent' (immediate parent only), 'ancestors' (walk up lineage, parent first), 'descendants' (walk down to children, BFS), 'project' (all sessions from same working directory, newest first), or a session filename." }),
+      sessions: Type.String({ description: "Which sessions to query: 'parent' (immediate parent only), 'ancestors' (walk up lineage, parent first), 'descendants' (walk down to children, BFS), 'project' (all sessions from same working directory, newest first), 'global' (all sessions across all projects, newest first), or a session filename." }),
+      limit: Type.Optional(Type.Number({ description: "Max windows to query. Defaults: 50 for ancestors/descendants/project/global, unlimited for parent and explicit filename." })),
+      offset: Type.Optional(Type.Number({ description: "Skip this many windows before querying. Use for pagination when a previous query didn't find what you needed. Default: 0." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const sessionFile = ctx.sessionManager.getSessionFile();
@@ -546,6 +573,10 @@ export default function (pi: ExtensionAPI) {
 
       const sessionDir = path.dirname(sessionFile);
       let targets: string[] = [];
+      const LIMITED_MODES = new Set(["ancestors", "descendants", "project", "global"]);
+      const DEFAULT_LIMIT = 50;
+      const limit = params.limit ?? (LIMITED_MODES.has(params.sessions) ? DEFAULT_LIMIT : Infinity);
+      const offset = params.offset ?? 0;
 
       if (params.sessions === "parent") {
         const chain = getAncestorChain(sessionFile, sessionDir);
@@ -569,6 +600,11 @@ export default function (pi: ExtensionAPI) {
         if (targets.length === 0) {
           return { content: [{ type: "text", text: "No sessions found in this project directory." }], isError: true };
         }
+      } else if (params.sessions === "global") {
+        targets = getGlobalSessions(sessionDir);
+        if (targets.length === 0) {
+          return { content: [{ type: "text", text: "No sessions found." }], isError: true };
+        }
       } else {
         // Treat as filename — resolve relative to session dir
         const target = path.resolve(sessionDir, params.sessions);
@@ -582,7 +618,7 @@ export default function (pi: ExtensionAPI) {
       targets = [...new Set(targets)];
 
       // Expand session files into duncan targets (one per compaction window)
-      const duncanTargets: DuncanTarget[] = [];
+      const allTargets: DuncanTarget[] = [];
       for (const target of targets) {
         try {
           const windows = getDuncanTargets(target);
@@ -591,21 +627,31 @@ export default function (pi: ExtensionAPI) {
             // but keep earlier windows — those are behind compaction barriers
             windows.pop();
           }
-          duncanTargets.push(...windows);
+          allTargets.push(...windows);
         } catch (err: any) {
           // If a file can't be parsed, skip it
         }
       }
 
-      if (duncanTargets.length === 0) {
+      if (allTargets.length === 0) {
         return { content: [{ type: "text", text: "No queryable context found in target sessions." }], isError: true };
       }
 
-      const sessionCount = targets.length;
+      // Apply offset and limit
+      const totalWindows = allTargets.length;
+      const duncanTargets = allTargets.slice(offset, offset + limit);
+
+      if (duncanTargets.length === 0) {
+        return { content: [{ type: "text", text: `No windows in range (offset ${offset}, total ${totalWindows}).` }], isError: true };
+      }
+
+      const sessionCount = new Set(duncanTargets.map(t => t.sessionFile)).size;
       const windowCount = duncanTargets.length;
+      const hasMore = offset + limit < totalWindows;
 
       const update = (text: string) => onUpdate?.({ content: [{ type: "text", text }] });
-      update(`**${params.question}**\n\nquerying ${windowCount} window${windowCount === 1 ? "" : "s"} from ${sessionCount} session${sessionCount === 1 ? "" : "s"} (${params.sessions})…`);
+      const rangeLabel = hasMore || offset > 0 ? ` (${offset}–${offset + windowCount} of ${totalWindows})` : "";
+      update(`**${params.question}**\n\nquerying ${windowCount} window${windowCount === 1 ? "" : "s"} from ${sessionCount} session${sessionCount === 1 ? "" : "s"}${rangeLabel} (${params.sessions})…`);
 
       let { model, apiKey } = await getModelAndKey(ctx);
       const systemPrompt = ctx.getSystemPrompt();
@@ -651,9 +697,15 @@ export default function (pi: ExtensionAPI) {
           : `### ${r.session}${windowLabel}\n${r.answer}`;
       }).join("\n\n---\n\n");
 
-      const formatted = `**${params.question}**\n\n${answers}`;
+      const parts = [`**${params.question}**\n\n${answers}`];
 
-      return { content: [{ type: "text", text: formatted }] };
+      if (hasMore) {
+        const nextOffset = offset + limit;
+        const remaining = totalWindows - nextOffset;
+        parts.push(`\n\n---\n*Queried ${windowCount} of ${totalWindows} windows (offset ${offset}). ${remaining} more available — call again with offset: ${nextOffset} to continue.*`);
+      }
+
+      return { content: [{ type: "text", text: parts.join("") }] };
     },
   });
 
