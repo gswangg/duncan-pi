@@ -6,6 +6,7 @@ import { Type } from "@sinclair/typebox";
 
 
 import { existsSync, openSync, readSync, readFileSync, closeSync, readdirSync, appendFileSync, mkdirSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import * as os from "node:os";
 
@@ -184,12 +185,15 @@ const __dirname = path.dirname(new URL(import.meta.url).pathname);
 const DUNCAN_LOG = process.env.DUNCAN_LOG ?? path.join(__dirname, "duncan.jsonl");
 
 interface DuncanRecord {
+  queryId: string;
   question: string;
   answer: string;
   hasContext: boolean;
   targetSession: string;
   windowIndex: number;
   sourceSession: string;
+  model: string;
+  provider: string;
   timestamp: string;
 }
 
@@ -704,7 +708,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: resolved.error }], isError: true };
       }
 
-      const { targets: duncanTargets, totalWindows, hasMore, offset } = resolved;
+      const { targets: duncanTargets, totalWindows, hasMore, offset, limit } = resolved;
       const sessionCount = new Set(duncanTargets.map(t => t.sessionFile)).size;
       const windowCount = duncanTargets.length;
 
@@ -732,26 +736,30 @@ export default function (pi: ExtensionAPI) {
         return defaultModelAndKey;
       };
 
-      const queryTarget = async (target: DuncanTarget): Promise<{ session: string; window: number; answer: string; hasContext: boolean }> => {
+      const queryId = randomUUID();
+
+      const queryTarget = async (target: DuncanTarget): Promise<{ session: string; window: number; answer: string; hasContext: boolean; modelLabel: string }> => {
         const targetSession = path.basename(target.sessionFile);
         try {
           const { model, apiKey } = await resolveModelForTarget(target);
+          const modelLabel = `${model.provider}/${model.id}`;
           const result = await duncanQuery(target.messages, params.question, model, apiKey, { systemPrompt, signal });
           recordQuery({
-            question: params.question, answer: result.answer, hasContext: result.hasContext,
-            targetSession, windowIndex: target.windowIndex, sourceSession, timestamp: new Date().toISOString(),
+            queryId, question: params.question, answer: result.answer, hasContext: result.hasContext,
+            targetSession, windowIndex: target.windowIndex, sourceSession,
+            model: model.id, provider: model.provider, timestamp: new Date().toISOString(),
           });
           completed++;
           update(`**${params.question}**\n\n${completed}/${windowCount} windows queried…`);
-          return { session: targetSession, window: target.windowIndex, ...result };
+          return { session: targetSession, window: target.windowIndex, modelLabel, ...result };
         } catch (err: any) {
           completed++;
           update(`**${params.question}**\n\n${completed}/${windowCount} windows queried…`);
-          return { session: targetSession, window: target.windowIndex, answer: `Error: ${err.message}`, hasContext: false };
+          return { session: targetSession, window: target.windowIndex, answer: `Error: ${err.message}`, hasContext: false, modelLabel: "unknown" };
         }
       };
 
-      const results: Array<{ session: string; window: number; answer: string; hasContext: boolean }> = [];
+      const results: Array<{ session: string; window: number; answer: string; hasContext: boolean; modelLabel: string }> = [];
 
       for (let i = 0; i < duncanTargets.length; i += BATCH_SIZE) {
         if (signal?.aborted) break;
@@ -766,9 +774,10 @@ export default function (pi: ExtensionAPI) {
 
       const answers = relevant.map(r => {
         const windowLabel = windowCount > sessionCount ? ` (window ${r.window})` : "";
-        return relevant.length === 1
-          ? r.answer
-          : `### ${r.session}${windowLabel}\n${r.answer}`;
+        if (relevant.length === 1) {
+          return `${r.answer}\n\n*— ${r.modelLabel}*`;
+        }
+        return `### ${r.session}${windowLabel}\n${r.answer}\n*— ${r.modelLabel}*`;
       }).join("\n\n---\n\n");
 
       const parts = [`**${params.question}**\n\n${answers}`];
