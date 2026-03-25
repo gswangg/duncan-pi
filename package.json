@@ -2,7 +2,9 @@
   "name": "@gswangg/pi-duncan",
   "version": "0.1.0",
   "description": "Session memory for pi — query dormant sessions, hand off context across session boundaries",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -10,17 +12,21 @@
   },
   "type": "module",
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
   },
   "devDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-ai": "^0.62.0",
+    "@mariozechner/pi-coding-agent": "^0.62.0",
     "@sinclair/typebox": "*"
   },
   "pi": {
-    "extensions": ["extensions"],
-    "skills": ["skills"]
+    "extensions": [
+      "extensions"
+    ],
+    "skills": [
+      "skills"
+    ]
   }
 }

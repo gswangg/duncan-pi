@@ -1,6 +1,6 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { buildSessionContext, convertToLlm, parseSessionEntries } from "@mariozechner/pi-coding-agent";
-import { completeSimple } from "@mariozechner/pi-ai";
+import { completeSimple, getModel } from "@mariozechner/pi-ai";
 import type { Model, Api } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 
@@ -23,6 +23,7 @@ import * as os from "node:os";
 export interface CompactionWindow {
   windowIndex: number;
   messages: any[]; // AgentMessage[]
+  modelInfo?: { provider: string; modelId: string };
 }
 
 /**
@@ -106,17 +107,37 @@ export function getCompactionWindows(entries: any[]): CompactionWindow[] {
   const collectMessages = (start: number, end: number): any[] =>
     pathEntries.slice(start, end).map(getMessageFromEntry).filter(Boolean);
 
+  // Helper: find the last model info in a range of pathEntries.
+  // Checks model_change entries and falls back to assistant message model/provider fields.
+  const resolveModelInfo = (start: number, end: number): { provider: string; modelId: string } | undefined => {
+    let info: { provider: string; modelId: string } | undefined;
+    for (let i = start; i < end; i++) {
+      const e = pathEntries[i];
+      if (e.type === "model_change" && e.provider && e.modelId) {
+        info = { provider: e.provider, modelId: e.modelId };
+      } else if (e.type === "message" && e.message?.role === "assistant") {
+        const msg = e.message;
+        if (msg.provider && msg.model) {
+          info = { provider: msg.provider, modelId: msg.model };
+        }
+      }
+    }
+    return info;
+  };
+
   // No compactions — single window with all messages
   if (compactionIndices.length === 0) {
     const messages = collectMessages(0, pathEntries.length);
-    return messages.length > 0 ? [{ windowIndex: 0, messages }] : [];
+    const modelInfo = resolveModelInfo(0, pathEntries.length);
+    return messages.length > 0 ? [{ windowIndex: 0, messages, modelInfo }] : [];
   }
 
   const windows: CompactionWindow[] = [];
 
   // Window 0: raw messages before first compaction
   const w0 = collectMessages(0, compactionIndices[0]);
-  if (w0.length > 0) windows.push({ windowIndex: 0, messages: w0 });
+  const m0 = resolveModelInfo(0, compactionIndices[0]);
+  if (w0.length > 0) windows.push({ windowIndex: 0, messages: w0, modelInfo: m0 });
 
   // Windows 1..N: compaction summary + kept messages + new messages until next boundary
   for (let k = 0; k < compactionIndices.length; k++) {
@@ -144,7 +165,10 @@ export function getCompactionWindows(entries: any[]): CompactionWindow[] {
     // New messages after compaction until next boundary
     messages.push(...collectMessages(compIdx + 1, nextBoundary));
 
-    if (messages.length > 0) windows.push({ windowIndex: k + 1, messages });
+    // Model info: check from start of session through this window's boundary
+    const modelInfo = resolveModelInfo(0, nextBoundary);
+
+    if (messages.length > 0) windows.push({ windowIndex: k + 1, messages, modelInfo });
   }
 
   return windows;
@@ -209,6 +233,7 @@ interface DuncanTarget {
   sessionFile: string;
   windowIndex: number;
   messages: any[]; // AgentMessage[]
+  modelInfo?: { provider: string; modelId: string };
 }
 
 export function getDuncanTargets(sessionFile: string): DuncanTarget[] {
@@ -219,6 +244,7 @@ export function getDuncanTargets(sessionFile: string): DuncanTarget[] {
     sessionFile,
     windowIndex: w.windowIndex,
     messages: w.messages,
+    modelInfo: w.modelInfo,
   }));
 }
 
@@ -686,15 +712,30 @@ export default function (pi: ExtensionAPI) {
       const rangeLabel = hasMore || offset > 0 ? ` (${offset}–${offset + windowCount} of ${totalWindows})` : "";
       update(`**${params.question}**\n\nquerying ${windowCount} window${windowCount === 1 ? "" : "s"} from ${sessionCount} session${sessionCount === 1 ? "" : "s"}${rangeLabel} (${params.sessions})…`);
 
-      let { model, apiKey } = await getModelAndKey(ctx);
+      const defaultModelAndKey = await getModelAndKey(ctx);
       const systemPrompt = ctx.getSystemPrompt();
       const sourceSession = path.basename(sessionFile);
       const BATCH_SIZE = 10;
       let completed = 0;
 
+      // Resolve model for a target: use the window's model if available, fall back to current session's model
+      const resolveModelForTarget = async (target: DuncanTarget): Promise<{ model: Model<Api>; apiKey: string }> => {
+        if (target.modelInfo) {
+          try {
+            const windowModel = getModel(target.modelInfo.provider as any, target.modelInfo.modelId as any);
+            const windowApiKey = await ctx.modelRegistry.getApiKeyForProvider(windowModel.provider);
+            if (windowApiKey) return { model: windowModel, apiKey: windowApiKey };
+          } catch {
+            // model not recognized or no API key — fall back to current model
+          }
+        }
+        return defaultModelAndKey;
+      };
+
       const queryTarget = async (target: DuncanTarget): Promise<{ session: string; window: number; answer: string; hasContext: boolean }> => {
         const targetSession = path.basename(target.sessionFile);
         try {
+          const { model, apiKey } = await resolveModelForTarget(target);
           const result = await duncanQuery(target.messages, params.question, model, apiKey, { systemPrompt, signal });
           recordQuery({
             question: params.question, answer: result.answer, hasContext: result.hasContext,
