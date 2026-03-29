@@ -691,10 +691,11 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       question: Type.String({ description: "The question to ask the dormant session. Should be specific and self-contained." }),
-      sessions: Type.String({ description: "Which sessions to query: 'parent' (immediate parent only), 'ancestors' (walk up lineage, parent first), 'descendants' (walk down to children, BFS), 'project' (all sessions from same working directory, newest first), 'global' (all sessions across all projects, newest first), or a session filename." }),
+      sessions: Type.String({ description: "Which sessions to query: 'parent' (immediate parent only), 'ancestors' (walk up lineage, parent first), 'descendants' (walk down to children, BFS), 'project' (all sessions from same working directory, newest first), 'global' (all sessions across all projects, newest first), 'self' (query own active window N times for sampling diversity), or a session filename." }),
       limit: Type.Optional(Type.Number({ description: "Max windows to query. Defaults: 50 for ancestors/descendants/project/global, unlimited for parent and explicit filename." })),
       offset: Type.Optional(Type.Number({ description: "Skip this many windows before querying. Use for pagination when a previous query didn't find what you needed. Default: 0." })),
-      batchSize: Type.Optional(Type.Number({ description: "Max concurrent API calls per batch. Default: 3. Lower to avoid rate limiting." })),
+      batchSize: Type.Optional(Type.Number({ description: "Max concurrent API calls per batch. Default: 10. Lower to avoid rate limiting." })),
+      copies: Type.Optional(Type.Number({ description: "For 'self' mode: number of parallel queries for sampling diversity (default: 3)." })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const sessionFile = ctx.sessionManager.getSessionFile();
@@ -703,6 +704,77 @@ export default function (pi: ExtensionAPI) {
       }
 
       const sessionDir = path.dirname(sessionFile);
+
+      // Self mode: query own active window N times for sampling diversity
+      if (params.sessions === "self") {
+        const windows = getDuncanTargets(sessionFile);
+        if (windows.length === 0) {
+          return { content: [{ type: "text", text: "No windows in active session." }], isError: true };
+        }
+        const activeWindow = windows[windows.length - 1];
+        const copies = (params as any).copies ?? 3;
+        const BATCH_SIZE = params.batchSize ?? 5;
+
+        const update = (text: string) => onUpdate?.({ content: [{ type: "text", text }] });
+        update(`**${params.question}**\n\nquerying active window ${copies} times (self mode)…`);
+
+        const defaultModelAndKey = await getModelAndKey(ctx);
+        const systemPrompt = ctx.getSystemPrompt();
+        const queryId = randomUUID();
+        const sourceSession = path.basename(sessionFile);
+        let completed = 0;
+
+        const resolveModel = async (): Promise<{ model: Model<Api>; apiKey: string }> => {
+          if (activeWindow.modelInfo) {
+            try {
+              const m = getModel(activeWindow.modelInfo.provider as any, activeWindow.modelInfo.modelId as any);
+              const k = await ctx.modelRegistry.getApiKeyForProvider(m.provider);
+              if (k) return { model: m, apiKey: k };
+            } catch {}
+          }
+          return defaultModelAndKey;
+        };
+
+        const queryOnce = async (): Promise<{ session: string; window: number; answer: string; hasContext: boolean; modelLabel: string }> => {
+          try {
+            const { model, apiKey } = await resolveModel();
+            const modelLabel = `${model.provider}/${model.id}`;
+            const result = await duncanQuery(activeWindow.messages, params.question, model, apiKey, { systemPrompt, signal });
+            recordQuery({
+              queryId, question: params.question, answer: result.answer, hasContext: result.hasContext,
+              targetSession: sourceSession, windowIndex: activeWindow.windowIndex, sourceSession,
+              model: model.id, provider: model.provider, timestamp: new Date().toISOString(),
+            });
+            completed++;
+            update(`**${params.question}**\n\n${completed}/${copies} queries completed…`);
+            return { session: sourceSession, window: activeWindow.windowIndex, modelLabel, ...result };
+          } catch (err: any) {
+            completed++;
+            update(`**${params.question}**\n\n${completed}/${copies} queries completed…`);
+            return { session: sourceSession, window: activeWindow.windowIndex, answer: `Error: ${err.message}`, hasContext: false, modelLabel: "unknown" };
+          }
+        };
+
+        const results: Array<{ session: string; window: number; answer: string; hasContext: boolean; modelLabel: string }> = [];
+
+        // Wave 1: prime cache
+        results.push(await queryOnce());
+        if (!signal?.aborted && copies > 1) {
+          // Wave 2: remaining copies in batches
+          const remaining = copies - 1;
+          for (let i = 0; i < remaining; i += BATCH_SIZE) {
+            if (signal?.aborted) break;
+            const batchCount = Math.min(BATCH_SIZE, remaining - i);
+            const batchResults = await Promise.all(Array.from({ length: batchCount }, () => queryOnce()));
+            results.push(...batchResults);
+          }
+        }
+
+        const answers = results.map((r, i) => `### Sample ${i + 1}\n${r.answer}\n*— ${r.modelLabel}*`).join("\n\n---\n\n");
+        const contextCount = results.filter(r => r.hasContext).length;
+        return { content: [{ type: "text", text: `**${params.question}** (${results.length} samples)\n\n${answers}\n\n*${contextCount}/${results.length} had relevant context. queryId: ${queryId}*` }] };
+      }
+
       const resolved = resolveTargets(params, sessionFile, sessionDir);
 
       if (resolved.error) {
