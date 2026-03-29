@@ -1,6 +1,6 @@
 {
   "name": "@gswangg/duncan-pi",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Session memory for pi \u2014 query dormant sessions, hand off context across session boundaries",
   "keywords": [
     "pi-package"
